@@ -1146,6 +1146,68 @@ async function runLoop(
 		break;
 	}
 
+	// EDGE G: POST-PROCESSING CLEANUP
+	// Strip whitespace-noise diffs that the agent may have accidentally introduced
+	// (trailing whitespace, line-ending normalization, identical-modulo-whitespace
+	// replacements). These add to the diff denominator without scoring matches —
+	// real human commits rarely include such cosmetic changes. Deterministic, safe:
+	// only restores ORIGINAL bytes for lines that differ ONLY in cosmetic ways.
+	if (hasProducedEdit) {
+		try {
+			const { spawnSync: _cleanSpawn } = await import("node:child_process");
+			const _fs = await import("node:fs");
+			for (const editedPath of editedPaths) {
+				try {
+					const norm = editedPath.replace(/^\.\//, "");
+					if (!norm || norm.includes("..")) continue;
+					if (!_fs.existsSync(norm)) continue;
+					const showResult = _cleanSpawn("git", ["show", `HEAD:${norm}`], {
+						cwd: process.cwd(), timeout: 1500, encoding: "utf-8", maxBuffer: 8 * 1024 * 1024,
+					});
+					if (showResult.status !== 0 || typeof showResult.stdout !== "string") continue;
+					const original = showResult.stdout;
+					let current: string;
+					try {
+						current = _fs.readFileSync(norm, "utf-8");
+					} catch { continue; }
+					if (original === current) continue;
+
+					// 1. If the entire file differs ONLY in trailing whitespace / line endings, restore original verbatim
+					const stripTrailingWs = (s: string) => s.split(/\r?\n/).map((l) => l.replace(/[ \t]+$/, "")).join("\n").replace(/\n+$/, "");
+					if (stripTrailingWs(original) === stripTrailingWs(current)) {
+						_fs.writeFileSync(norm, original, "utf-8");
+						continue;
+					}
+
+					// 2. Per-line cleanup: restore lines that differ ONLY in trailing whitespace
+					//    AND restore identical-content lines that drifted due to line-ending changes
+					const origLines = original.split(/\r?\n/);
+					const currLines = current.split(/\r?\n/);
+					if (origLines.length === currLines.length) {
+						let changed = false;
+						const cleaned = currLines.map((c, i) => {
+							const o = origLines[i];
+							if (o === undefined) return c;
+							if (o === c) return c;
+							// Same content modulo trailing whitespace → restore original byte-for-byte
+							if (o.replace(/[ \t]+$/, "") === c.replace(/[ \t]+$/, "")) {
+								changed = true;
+								return o;
+							}
+							return c;
+						});
+						if (changed) {
+							// Preserve original line ending (LF vs CRLF) by detecting from original
+							const sep = original.includes("\r\n") ? "\r\n" : "\n";
+							const trailing = original.endsWith("\n") ? "\n" : "";
+							_fs.writeFileSync(norm, cleaned.join(sep).replace(/\n+$/, "") + trailing, "utf-8");
+						}
+					}
+				} catch { /* skip this file */ }
+			}
+		} catch { /* cleanup is best-effort, never block agent_end */ }
+	}
+
 	await emit({ type: "agent_end", messages: newMessages });
 }
 
