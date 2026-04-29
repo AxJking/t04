@@ -261,7 +261,7 @@ function parsePathLinesFromSearchOutput(output: string, maxPaths: number): strin
 }
 
 async function discoverFilesByTaskKeywords(cwd: string, taskText: string, maxFiles: number): Promise<string[]> {
-	const terms = extractFeatureSearchTerms(taskText, 18);
+	const terms = extractFeatureSearchTerms(taskText, 12);
 	if (terms.length === 0) return [];
 	const { spawnSync } = await import("node:child_process");
 	const hits = new Map<string, number>();
@@ -288,8 +288,8 @@ async function discoverFilesByTaskKeywords(cwd: string, taskText: string, maxFil
 			const r = spawnSync("rg", args, {
 				cwd,
 				encoding: "utf-8",
-				maxBuffer: 6 * 1024 * 1024,
-				timeout: 4000,
+				maxBuffer: 4 * 1024 * 1024,
+				timeout: 2800,
 			});
 			if (r.status === 0 && typeof r.stdout === "string" && r.stdout.trim()) {
 				return r.stdout
@@ -305,7 +305,7 @@ async function discoverFilesByTaskKeywords(cwd: string, taskText: string, maxFil
 			const r2 = spawnSync(
 				"grep",
 				["-rIl", "--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=dist", "-e", term, "."],
-				{ cwd, encoding: "utf-8", maxBuffer: 6 * 1024 * 1024, timeout: 4500 },
+				{ cwd, encoding: "utf-8", maxBuffer: 4 * 1024 * 1024, timeout: 3500 },
 			);
 			if (r2.status === 0 && typeof r2.stdout === "string" && r2.stdout.trim()) {
 				return r2.stdout
@@ -322,7 +322,7 @@ async function discoverFilesByTaskKeywords(cwd: string, taskText: string, maxFil
 
 	for (let i = 0; i < terms.length; i++) {
 		const weight = terms.length - i;
-		const files = rgList(terms[i]!).slice(0, 40);
+		const files = rgList(terms[i]!).slice(0, 22);
 		for (const f of files) hits.set(f, (hits.get(f) ?? 0) + weight);
 	}
 
@@ -419,22 +419,7 @@ async function runLoop(
 		return files;
 	};
 
-	/** Dedupe by normalized path; `primary` order wins (task-derived hits stay first). */
-	const mergePathsPrimaryFirst = (primary: string[], secondary: string[], cap: number): string[] => {
-		const seen = new Set<string>();
-		const out: string[] = [];
-		const add = (p: string) => {
-			const n = p.replace(/^\.\//, "");
-			if (!n || seen.has(n)) return;
-			seen.add(n);
-			out.push(p);
-		};
-		for (const p of primary) add(p);
-		for (const p of secondary) add(p);
-		return out.slice(0, cap);
-	};
-
-	// Secondary: structured path bullets in the prompt (explicit / likely file lists).
+	// Extract expected files from system prompt or initial messages
 	const systemPromptText = (currentContext as any).systemPrompt || "";
 	let expectedFiles: string[] = parseExpectedFiles(systemPromptText);
 	if (expectedFiles.length === 0) {
@@ -443,50 +428,16 @@ async function runLoop(
 			for (const block of msg.content as any[]) {
 				if (block?.type === "text" && typeof block.text === "string") {
 					const parsed = parseExpectedFiles(block.text);
-					if (parsed.length > 0) {
-						expectedFiles = parsed;
-						break;
-					}
+					if (parsed.length > 0) { expectedFiles = parsed; break; }
 				}
 			}
 			if (expectedFiles.length > 0) break;
 		}
 	}
-
-	// Highest priority: task-ish text → needles → ripgrep/grep (behavioral tasks).
-	const taskBlob = collectTaskTextForKeywordDiscovery(currentContext);
-	const keywordHits = await discoverFilesByTaskKeywords(process.cwd(), taskBlob, 48);
-	const hintKeys = new Set(expectedFiles.map((f) => f.replace(/^\.\//, "")));
-	const newFromKeywords = keywordHits.filter((f) => !hintKeys.has(f.replace(/^\.\//, "")));
-	foundFiles = mergePathsPrimaryFirst(keywordHits, expectedFiles, 52);
-	if (foundFiles.length > 0) workPhase = "absorb";
-
-	if (keywordHits.length > 0 && (expectedFiles.length === 0 || newFromKeywords.length > 0)) {
-		const preview = foundFiles.slice(0, 18).map((p: string) => `- ${p}`).join("\n");
-		const terms = extractFeatureSearchTerms(taskBlob, 14);
-		const termNote =
-			terms.length > 0
-				? ` Search terms from task text (primary): ${terms.map((t) => `\`${t}\``).join(", ")}.`
-				: "";
-		const extra =
-			expectedFiles.length > 0 && newFromKeywords.length > 0
-				? `Paths from task wording not in the path-list section: ${newFromKeywords.slice(0, 16).map((p: string) => `\`${p}\``).join(", ")}. Listed targets are ordered with task-derived matches first, then prompt path hints. `
-				: "";
-		pendingMessages.push({
-			role: "user",
-			content: [
-				{
-					type: "text",
-					text:
-						expectedFiles.length > 0
-							? `Primary file discovery is from the task description (content search). ${extra}Read in this order — task hits first — then edit:\n${preview}${termNote}`
-							: `Pre-discovery: matched task text to ${keywordHits.length} candidate file(s) (highest priority). Read before editing:\n${preview}${termNote}`,
-				},
-			],
-			timestamp: Date.now(),
-		});
+	if (expectedFiles.length > 0) {
+		foundFiles = [...expectedFiles];
+		workPhase = "absorb";
 	}
-
 	let coverageRetries = 0;
 	const MAX_COVERAGE_RETRIES = 4;
 
@@ -569,9 +520,9 @@ async function runLoop(
 		});
 		let breadthHint = "";
 		if (consecutiveEditsOnSameFile >= 3 && uneditedTargets.length > 0) {
-			breadthHint = ` STOP editing \`${normTarget}\` — you have made ${consecutiveEditsOnSameFile} consecutive edits on it. ${uneditedTargets.length} file(s) still need ANY edit: ${uneditedTargets.slice(0, 12).map((f: string) => `\`${f}\``).join(", ")}. Move to the next file NOW. One edit per file scores far higher than many edits on one file.`;
+			breadthHint = ` STOP editing \`${normTarget}\` — you have made ${consecutiveEditsOnSameFile} consecutive edits on it. ${uneditedTargets.length} file(s) still need ANY edit: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Move to the next file NOW. One edit per file scores far higher than many edits on one file.`;
 		} else if (uneditedTargets.length > 0) {
-			breadthHint = ` ${uneditedTargets.length} target file(s) still need edits: ${uneditedTargets.slice(0, 12).map((f: string) => `\`${f}\``).join(", ")}. Move to the next unedited file — breadth across files scores higher than depth in one file.`;
+			breadthHint = ` ${uneditedTargets.length} target file(s) still need edits: ${uneditedTargets.slice(0, 6).map((f: string) => `\`${f}\``).join(", ")}. Move to the next unedited file — breadth across files scores higher than depth in one file.`;
 		}
 		let siblingHint = "";
 		// v33: SKIP sibling auto-discovery entirely when `expectedFiles` was
@@ -601,7 +552,7 @@ async function runLoop(
 							const fext = name.includes('.') ? '.' + name.split('.').pop() : '';
 							return codeExts.has(fext) || name.includes(".test.") || name.includes(".spec.") || name.includes(".freezed.");
 						})
-						.slice(0, 14);
+						.slice(0, 8);
 					if (related.length > 0) {
 						for (const rf of related) {
 							if (!foundFiles.includes(rf)) foundFiles.push(rf);
@@ -621,14 +572,14 @@ async function runLoop(
 			],
 			timestamp: Date.now(),
 		});
-		if (firstMutation && !multiFileHintSent && (foundFiles.length >= 3 || pathsAlreadyRead.size >= 3)) {
+		if (firstMutation && !multiFileHintSent && (foundFiles.length >= 4 || pathsAlreadyRead.size >= 4)) {
 			multiFileHintSent = true;
 			// v33: if there are many candidate paths AND this is the
 			// first successful mutation, explicitly demand parallel
 			// edits in the next turn. Otherwise the LLM often goes
 			// one file per turn and times out on wide tasks.
 			const targetCount = Math.max(foundFiles.length, pathsAlreadyRead.size);
-			const parallelHint = targetCount >= 5
+			const parallelHint = targetCount >= 6
 				? ` Emit MULTIPLE \`edit\` calls in one response — all tool calls in the same turn run in parallel. Do NOT edit one file per turn.`
 				: "";
 			pendingMessages.push({
@@ -686,7 +637,7 @@ async function runLoop(
 					if (!_dm) continue;
 					if (_dm[1] === "A" || _dm[1] === "M") _rf.push(_dm[2]);
 				}
-				if (_rf.length > 0 && _rf.length <= 35) {
+				if (_rf.length > 0 && _rf.length <= 20) {
 					const _norm = (s: string) => s.replace(/^\.\//, "");
 					let toMerge = _rf;
 					if (expectedFiles.length > 0) {
@@ -699,9 +650,9 @@ async function runLoop(
 						});
 					}
 					if (toMerge.length > 0) {
-						// Tertiary: git diff paths — append after task-derived + structured hints.
-						foundFiles = mergePathsPrimaryFirst(foundFiles, toMerge, 58);
-						expectedFiles = mergePathsPrimaryFirst(expectedFiles, toMerge, 58);
+						const merged = new Set([...foundFiles, ...toMerge, ...expectedFiles]);
+						foundFiles = [...merged];
+						expectedFiles = [...merged];
 						workPhase = "absorb";
 					}
 				}
@@ -709,6 +660,52 @@ async function runLoop(
 		}
 	} catch {
 		/* not a git repo or git unavailable */
+	}
+
+	// Always merge task-ish text → ripgrep/grep hits with any hint/git paths (not only when empty).
+	const taskBlob = collectTaskTextForKeywordDiscovery(currentContext);
+	const keywordHits = await discoverFilesByTaskKeywords(process.cwd(), taskBlob, 22);
+	const normFoundKey = (p: string) => p.replace(/^\.\//, "");
+	const hadPriorFiles = foundFiles.length > 0;
+	const priorKeys = new Set(foundFiles.map((f) => normFoundKey(f)));
+	const newFromKeywords = keywordHits.filter((f) => !priorKeys.has(normFoundKey(f)));
+	if (keywordHits.length > 0) {
+		const seen = new Set<string>();
+		const merged: string[] = [];
+		const add = (p: string) => {
+			const n = normFoundKey(p);
+			if (seen.has(n)) return;
+			seen.add(n);
+			merged.push(p);
+		};
+		for (const f of foundFiles) add(f);
+		for (const f of keywordHits) add(f);
+		foundFiles = merged.slice(0, 28);
+		if (foundFiles.length > 0) workPhase = "absorb";
+	}
+	if (keywordHits.length > 0 && (!hadPriorFiles || newFromKeywords.length > 0)) {
+		const preview = foundFiles.slice(0, 12).map((p: string) => `- ${p}`).join("\n");
+		const terms = extractFeatureSearchTerms(taskBlob, 8);
+		const termNote =
+			terms.length > 0
+				? ` Search terms from task text: ${terms.map((t) => `\`${t}\``).join(", ")}.`
+				: "";
+		const extra =
+			hadPriorFiles && newFromKeywords.length > 0
+				? `Additional paths from task wording (not in the path list): ${newFromKeywords.slice(0, 10).map((p: string) => `\`${p}\``).join(", ")}. `
+				: "";
+		pendingMessages.push({
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: hadPriorFiles
+						? `Task-derived content search merged ${keywordHits.length} hit(s) into your target list. ${extra}Read before editing:\n${preview}${termNote}`
+						: `Pre-discovery: matched task text to ${keywordHits.length} candidate file(s). Read before editing:\n${preview}${termNote}`,
+				},
+			],
+			timestamp: Date.now(),
+		});
 	}
 
 	while (true) {
@@ -893,7 +890,7 @@ async function runLoop(
 				if (missing.length > 0) {
 					coverageRetries++;
 					await emit({ type: "turn_end", message, toolResults: [] });
-					const list = missing.slice(0, 10).map((f) => `\`${f}\``).join(", ");
+					const list = missing.slice(0, 5).map((f) => `\`${f}\``).join(", ");
 					pendingMessages.push({
 						role: "user",
 						content: [{ type: "text", text: `DO NOT STOP. These files have NOT been edited: ${list}. Each missed file = lost points. Read and edit them NOW. You said you would stop but the task is not complete.` }],
@@ -1088,12 +1085,12 @@ async function runLoop(
 								if (tr.toolName === "find") {
 									const pattern = args?.pattern || args?.glob || "*";
 									const dir = args?.path || ".";
-									bashCmd = `find ${dir} -type f -name "${pattern}" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | head -45`;
+									bashCmd = `find ${dir} -type f -name "${pattern}" -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" | head -30`;
 								} else {
 									const pattern = args?.pattern || "";
 									const searchPath = args?.path || ".";
 									const glob = args?.glob ? `--include="${args.glob}"` : "";
-									bashCmd = `grep -rnl ${glob} --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist "${pattern}" ${searchPath} | head -40`;
+									bashCmd = `grep -rnl ${glob} --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist "${pattern}" ${searchPath} | head -20`;
 								}
 								pendingMessages.push({
 									role: "user",
@@ -1109,16 +1106,16 @@ async function runLoop(
 					for (const tr of toolResults) {
 						if ((tr.toolName === "bash" || tr.toolName === "grep" || tr.toolName === "find") && !tr.isError) {
 							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-							const paths = parsePathLinesFromSearchOutput(output, 48);
+							const paths = parsePathLinesFromSearchOutput(output, 24);
 							if (paths.length > 0) {
-								foundFiles = paths.slice(0, 40);
+								foundFiles = paths.slice(0, 20);
 								workPhase = "absorb";
 								pendingMessages.push({
 									role: "user",
 									content: [
 										{
 											type: "text",
-											text: `Located ${foundFiles.length} candidate files. Read each file you intend to modify before making any edit:\n${foundFiles.slice(0, 18).map((p: string) => `- ${p}`).join("\n")}`,
+											text: `Located ${foundFiles.length} candidate files. Read each file you intend to modify before making any edit:\n${foundFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}`,
 										},
 									],
 									timestamp: Date.now(),
@@ -1139,11 +1136,7 @@ async function runLoop(
 							workPhase = "apply";
 						}
 					}
-					let absorbWant = 4;
-					if (foundFiles.length > 18) absorbWant = 12;
-					else if (foundFiles.length > 10) absorbWant = 8;
-					else if (foundFiles.length > 6) absorbWant = 6;
-					const absorbLimit = Math.min(Math.max(3, absorbWant), 14, foundFiles.length);
+					const absorbLimit = Math.min(Math.max(3, foundFiles.length > 10 ? 6 : 3), 8);
 					if (absorbedFiles.size >= absorbLimit && workPhase === "absorb" && pendingMessages.length === 0) {
 						workPhase = "apply";
 						pendingMessages.push({
@@ -1187,7 +1180,7 @@ async function runLoop(
 								content: [
 									{
 										type: "text",
-										text: `You have read \`${rp}\` ${cnt} times — stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 10).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` or \`write\` on a different file or stop."}`,
+										text: `You have read \`${rp}\` ${cnt} times — stop re-reading it. ${others.length > 0 ? `Move to a file you have not edited yet: ${others.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply \`edit\` or \`write\` on a different file or stop."}`,
 									},
 								],
 								timestamp: Date.now(),
@@ -1197,7 +1190,7 @@ async function runLoop(
 					}
 				}
 
-				const dynamicExploreCeiling = Math.max(4, Math.min(foundFiles.length + 2, 12));
+				const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 6));
 				if (!hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
 					pendingMessages.push({
 						role: "user",
@@ -1300,7 +1293,7 @@ async function runLoop(
 							role: "user",
 							content: [{
 								type: "text",
-								text: `30s+ elapsed and you have only edited ${uniqueEdited.size} file(s). ${uneditedFound.length} discovered target(s) remain: ${uneditedFound.slice(0, 14).map((f: string) => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.${batchHint}`,
+								text: `30s+ elapsed and you have only edited ${uniqueEdited.size} file(s). ${uneditedFound.length} discovered target(s) remain: ${uneditedFound.slice(0, 8).map((f: string) => `\`${f}\``).join(", ")}. Read and edit each one before going back to files you already edited.${batchHint}`,
 							}],
 							timestamp: Date.now(),
 						});
@@ -1373,7 +1366,7 @@ async function runLoop(
 				break;
 			}
 			const hint = uneditedTargets.length > 0
-				? `Unedited target files: ${uneditedTargets.slice(0, 12).map((f: string) => `\`${f}\``).join(", ")}. Read and edit them.`
+				? `Unedited target files: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Read and edit them.`
 				: `Re-read the task acceptance criteria. If the task listed exact old strings or labels, grep the repo for any that remain. Are there files or criteria you missed? If yes, discover and edit them. If all criteria are covered, reply "done".`;
 			pendingMessages = [{
 				role: "user",
