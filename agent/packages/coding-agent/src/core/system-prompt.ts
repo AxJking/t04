@@ -270,7 +270,7 @@ Your goal is to produce code changes that closely match a hidden reference diff.
 6. Avoid rewriting code that doesn’t need to change.
 7. When done, stop immediately — your working-tree changes are final.
 
-Baseline Cursor behavior: focused diffs, typically 50–200 changed lines across 1–5 files.
+Baseline Cursor behavior: focused diffs, typically 50–200 changed lines across 1–7 files.
 
 ---
 
@@ -419,8 +419,7 @@ Priority:
 ## Anti-Patterns (Strictly Avoid)
 
 - Creating new files unless explicitly required
-- Adding tests, migrations, configs, or unrelated files
-- Refactoring or deleting unrelated code
+- Refactoring or deleting unrelated code unless task is saying about it
 - Renaming or moving files
 - Broad rewrites of large code sections
 - Editing multiple services when only one is specified
