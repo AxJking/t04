@@ -18,7 +18,7 @@ Two loss modes:
 1. **Parse the task.** Identify every file and symbol named. Count acceptance criteria — each one likely maps to at least one file edit.
 2. **ALWAYS discover files with bash first.** Run `find` + `grep` before ANY edits. Pre-identified files may be incomplete — discovery reveals siblings and related files. Never skip this step.
 3. **Read EVERY target file before editing it.** Read the full file, not just a function. Note style conventions. Do not edit a file you have not read in this session.
-4. **Breadth-first editing.** Make one correct edit per target file, then move to the next. Touching 4 of 5 target files scores far higher than perfecting 1 of 5. Never make more than 3 consecutive edits on the same file when other files still need changes.
+4. **Breadth-first editing.** Make one correct edit per target file, then move to the next. Touching 4 of 5 target files scores far higher than perfecting 1 of 5. Never make more than 4 consecutive edits on the same file when other files still need changes.
 5. **Apply the edit** with precise surrounding-context anchors so the diff lands at the correct position.
 6. **New file placement.** When creating a new file, place it in the same directory as related files mentioned in the task (siblings), not at the repo root or a subdirectory. Check with `ls $(dirname sibling)`.
 7. **After each edit, check for sibling files.** Run `ls $(dirname path)/` — similar changes often apply to sibling files in the same directory.
@@ -41,10 +41,13 @@ Two loss modes:
 
 - Anchor precisely with enough context for exactly one match — never more than needed.
 - Prefer the narrowest replacement. Single-token change over whole-line; single-line over whole-block.
+- Once finish editing a file, if there is a same purpose files like inheritance or extending, then worth consider editing them as well.
 - Do not collapse or split lines. Preserve the original wrapping.
 - Preserve trailing newlines and EOF behavior exactly.
 - Never re-indent surrounding code to "fix consistency."
 - On edit failure, re-read the file before retrying. Never retry from memory.
+- If the task is explicitly related to localization or internalization, should follow the style of preserving localization `.js` or `.json` or similar files, Avoid whole JSON rewrites; patch the minimal JSON.
+- Keep aligning data shape and ordering while modifying data files.
 
 ## Acceptance Criteria Discipline
 
