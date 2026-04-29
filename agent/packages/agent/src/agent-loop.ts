@@ -419,7 +419,22 @@ async function runLoop(
 		return files;
 	};
 
-	// Extract expected files from system prompt or initial messages
+	/** Dedupe by normalized path; `primary` order wins (task-derived hits stay first). */
+	const mergePathsPrimaryFirst = (primary: string[], secondary: string[], cap: number): string[] => {
+		const seen = new Set<string>();
+		const out: string[] = [];
+		const add = (p: string) => {
+			const n = p.replace(/^\.\//, "");
+			if (!n || seen.has(n)) return;
+			seen.add(n);
+			out.push(p);
+		};
+		for (const p of primary) add(p);
+		for (const p of secondary) add(p);
+		return out.slice(0, cap);
+	};
+
+	// Secondary: structured path bullets in the prompt (explicit / likely file lists).
 	const systemPromptText = (currentContext as any).systemPrompt || "";
 	let expectedFiles: string[] = parseExpectedFiles(systemPromptText);
 	if (expectedFiles.length === 0) {
@@ -428,16 +443,50 @@ async function runLoop(
 			for (const block of msg.content as any[]) {
 				if (block?.type === "text" && typeof block.text === "string") {
 					const parsed = parseExpectedFiles(block.text);
-					if (parsed.length > 0) { expectedFiles = parsed; break; }
+					if (parsed.length > 0) {
+						expectedFiles = parsed;
+						break;
+					}
 				}
 			}
 			if (expectedFiles.length > 0) break;
 		}
 	}
-	if (expectedFiles.length > 0) {
-		foundFiles = [...expectedFiles];
-		workPhase = "absorb";
+
+	// Highest priority: task-ish text → needles → ripgrep/grep (behavioral tasks).
+	const taskBlob = collectTaskTextForKeywordDiscovery(currentContext);
+	const keywordHits = await discoverFilesByTaskKeywords(process.cwd(), taskBlob, 48);
+	const hintKeys = new Set(expectedFiles.map((f) => f.replace(/^\.\//, "")));
+	const newFromKeywords = keywordHits.filter((f) => !hintKeys.has(f.replace(/^\.\//, "")));
+	foundFiles = mergePathsPrimaryFirst(keywordHits, expectedFiles, 52);
+	if (foundFiles.length > 0) workPhase = "absorb";
+
+	if (keywordHits.length > 0 && (expectedFiles.length === 0 || newFromKeywords.length > 0)) {
+		const preview = foundFiles.slice(0, 18).map((p: string) => `- ${p}`).join("\n");
+		const terms = extractFeatureSearchTerms(taskBlob, 14);
+		const termNote =
+			terms.length > 0
+				? ` Search terms from task text (primary): ${terms.map((t) => `\`${t}\``).join(", ")}.`
+				: "";
+		const extra =
+			expectedFiles.length > 0 && newFromKeywords.length > 0
+				? `Paths from task wording not in the path-list section: ${newFromKeywords.slice(0, 16).map((p: string) => `\`${p}\``).join(", ")}. Listed targets are ordered with task-derived matches first, then prompt path hints. `
+				: "";
+		pendingMessages.push({
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text:
+						expectedFiles.length > 0
+							? `Primary file discovery is from the task description (content search). ${extra}Read in this order — task hits first — then edit:\n${preview}${termNote}`
+							: `Pre-discovery: matched task text to ${keywordHits.length} candidate file(s) (highest priority). Read before editing:\n${preview}${termNote}`,
+				},
+			],
+			timestamp: Date.now(),
+		});
 	}
+
 	let coverageRetries = 0;
 	const MAX_COVERAGE_RETRIES = 4;
 
@@ -637,7 +686,7 @@ async function runLoop(
 					if (!_dm) continue;
 					if (_dm[1] === "A" || _dm[1] === "M") _rf.push(_dm[2]);
 				}
-				if (_rf.length > 0 && _rf.length <= 20) {
+				if (_rf.length > 0 && _rf.length <= 35) {
 					const _norm = (s: string) => s.replace(/^\.\//, "");
 					let toMerge = _rf;
 					if (expectedFiles.length > 0) {
@@ -650,9 +699,9 @@ async function runLoop(
 						});
 					}
 					if (toMerge.length > 0) {
-						const merged = new Set([...foundFiles, ...toMerge, ...expectedFiles]);
-						foundFiles = [...merged];
-						expectedFiles = [...merged];
+						// Tertiary: git diff paths — append after task-derived + structured hints.
+						foundFiles = mergePathsPrimaryFirst(foundFiles, toMerge, 58);
+						expectedFiles = mergePathsPrimaryFirst(expectedFiles, toMerge, 58);
 						workPhase = "absorb";
 					}
 				}
@@ -660,52 +709,6 @@ async function runLoop(
 		}
 	} catch {
 		/* not a git repo or git unavailable */
-	}
-
-	// Always merge task-ish text → ripgrep/grep hits with any hint/git paths (not only when empty).
-	const taskBlob = collectTaskTextForKeywordDiscovery(currentContext);
-	const keywordHits = await discoverFilesByTaskKeywords(process.cwd(), taskBlob, 48);
-	const normFoundKey = (p: string) => p.replace(/^\.\//, "");
-	const hadPriorFiles = foundFiles.length > 0;
-	const priorKeys = new Set(foundFiles.map((f) => normFoundKey(f)));
-	const newFromKeywords = keywordHits.filter((f) => !priorKeys.has(normFoundKey(f)));
-	if (keywordHits.length > 0) {
-		const seen = new Set<string>();
-		const merged: string[] = [];
-		const add = (p: string) => {
-			const n = normFoundKey(p);
-			if (seen.has(n)) return;
-			seen.add(n);
-			merged.push(p);
-		};
-		for (const f of foundFiles) add(f);
-		for (const f of keywordHits) add(f);
-		foundFiles = merged.slice(0, 52);
-		if (foundFiles.length > 0) workPhase = "absorb";
-	}
-	if (keywordHits.length > 0 && (!hadPriorFiles || newFromKeywords.length > 0)) {
-		const preview = foundFiles.slice(0, 18).map((p: string) => `- ${p}`).join("\n");
-		const terms = extractFeatureSearchTerms(taskBlob, 14);
-		const termNote =
-			terms.length > 0
-				? ` Search terms from task text: ${terms.map((t) => `\`${t}\``).join(", ")}.`
-				: "";
-		const extra =
-			hadPriorFiles && newFromKeywords.length > 0
-				? `Additional paths from task wording (not in the path list): ${newFromKeywords.slice(0, 16).map((p: string) => `\`${p}\``).join(", ")}. `
-				: "";
-		pendingMessages.push({
-			role: "user",
-			content: [
-				{
-					type: "text",
-					text: hadPriorFiles
-						? `Task-derived content search merged ${keywordHits.length} hit(s) into your target list. ${extra}Read before editing:\n${preview}${termNote}`
-						: `Pre-discovery: matched task text to ${keywordHits.length} candidate file(s). Read before editing:\n${preview}${termNote}`,
-				},
-			],
-			timestamp: Date.now(),
-		});
 	}
 
 	while (true) {
