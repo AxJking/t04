@@ -48,6 +48,7 @@ Two loss modes:
 - On edit failure, re-read the file before retrying. Never retry from memory.
 - If the task is explicitly related to localization or internalization, should follow the style of preserving localization `.js` or `.json` or similar files, Avoid whole JSON rewrites; patch the minimal JSON.
 - Keep aligning data shape and ordering while modifying data files.
+- If the task touches logic, worth finding related test files and edit them.
 
 ## Acceptance Criteria Discipline
 
