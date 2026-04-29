@@ -149,6 +149,189 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 	);
 }
 
+/** English / instruction noise — not useful as repo search needles. */
+const KEYWORD_STOPWORDS = new Set(
+	[
+		"that", "this", "with", "from", "have", "been", "were", "will", "your", "must", "should",
+		"would", "could", "their", "there", "these", "those", "what", "when", "where", "which",
+		"while", "without", "within", "about", "after", "before", "between", "through", "during",
+		"under", "above", "below", "again", "once", "also", "only", "just", "even", "than", "then",
+		"them", "they", "into", "onto", "such", "same", "some", "very", "more", "most", "much",
+		"many", "other", "another", "each", "every", "both", "either", "neither", "make", "sure",
+		"task", "tasks", "acceptance", "criteria", "criterion", "behavior", "behavioral", "implement",
+		"change", "update", "modify", "create", "remove", "delete", "ensure", "follow", "using",
+		"repository", "project", "solution", "submit", "complete", "correct", "incorrect", "please",
+		"note", "notes", "description", "requirements", "requirement", "instructions", "instruction",
+	].map((w) => w.toLowerCase()),
+);
+
+/** Common code / schema tokens that match everywhere — poor grep needles. */
+const KEYWORD_CODE_NOISE = new Set(
+	[
+		"return", "function", "import", "export", "const", "let", "var", "from", "default", "async",
+		"await", "class", "extends", "interface", "type", "true", "false", "null", "undefined", "void",
+		"string", "number", "boolean", "object", "array", "promise", "error", "static", "public",
+		"private", "protected", "module", "require", "package", "json", "yaml", "http", "https",
+		"test", "tests", "spec", "describe", "expect", "assert", "example", "examples",
+	].map((w) => w.toLowerCase()),
+);
+
+function collectTaskTextForKeywordDiscovery(context: AgentContext): string {
+	const chunks: string[] = [];
+	const sys = (context as { systemPrompt?: string }).systemPrompt;
+	if (typeof sys === "string" && sys.length > 0) chunks.push(sys);
+	for (const msg of context.messages) {
+		if (msg.role !== "user") continue;
+		if (!("content" in msg) || !Array.isArray(msg.content)) continue;
+		for (const block of msg.content as { type?: string; text?: string }[]) {
+			if (block?.type === "text" && typeof block.text === "string") chunks.push(block.text);
+		}
+	}
+	const full = chunks.join("\n\n");
+	return full.length > 48_000 ? full.slice(0, 48_000) : full;
+}
+
+/**
+ * Pull identifier-like and quoted phrases from natural-language / behavioral task text
+ * so we can ripgrep the workspace for likely implementation files.
+ */
+function extractFeatureSearchTerms(taskText: string, maxTerms: number): string[] {
+	const stripped = taskText.replace(/```[\s\S]*?```/g, " ");
+	const scored: { term: string; score: number }[] = [];
+	const seenLower = new Set<string>();
+
+	const consider = (raw: string, score: number) => {
+		const term = raw.replace(/\s+/g, " ").trim();
+		if (term.length < 4 || term.length > 72) return;
+		if (/[\r\n]/.test(term)) return;
+		if (/[/\\]/.test(term)) return;
+		if (/^[0-9][0-9,.\s]*$/.test(term)) return;
+		const low = term.toLowerCase();
+		if (seenLower.has(low)) return;
+		if (KEYWORD_STOPWORDS.has(low) || KEYWORD_CODE_NOISE.has(low)) return;
+		seenLower.add(low);
+		scored.push({ term, score });
+	};
+
+	for (const m of stripped.matchAll(/`([^`\n]{4,72})`/g)) consider(m[1]!, 120);
+	for (const m of stripped.matchAll(/"([^"\n]{4,60})"/g)) consider(m[1]!, 95);
+	for (const m of stripped.matchAll(/'([^'\n]{4,60})'/g)) consider(m[1]!, 90);
+	for (const m of stripped.matchAll(/\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b/g)) consider(m[1]!, 85);
+	for (const m of stripped.matchAll(/\b([a-z][a-z0-9]*(?:_[a-z0-9_]+){1,})\b/g)) consider(m[1]!, 80);
+	for (const m of stripped.matchAll(/\b([a-z]{7,})\b/gi)) {
+		const w = m[1]!;
+		const low = w.toLowerCase();
+		if (KEYWORD_STOPWORDS.has(low) || KEYWORD_CODE_NOISE.has(low)) continue;
+		consider(w, 40 + Math.min(w.length, 16));
+	}
+
+	scored.sort((a, b) => b.score - a.score || b.term.length - a.term.length);
+	const out: string[] = [];
+	for (const { term } of scored) {
+		if (out.length >= maxTerms) break;
+		out.push(term);
+	}
+	return out;
+}
+
+function lineLooksLikeRepoPath(line: string): boolean {
+	const t = line.trim();
+	if (!t || t.includes("\0")) return false;
+	if (t.startsWith("#") || t.startsWith("Binary")) return false;
+	if (/\s/.test(t)) return false;
+	if (/(^|\/)(node_modules|\.git)(\/|$)/.test(t)) return false;
+	if (/(^|\/)dist(\/|$)/.test(t) || /(^|\/)build(\/|$)/.test(t) || /(^|\/)\.next(\/|$)/.test(t)) return false;
+	if (/[/\\]/.test(t) || /\.[a-zA-Z0-9]{1,12}$/.test(t)) return true;
+	// Extensionless single-segment paths (e.g. Dockerfile, Makefile) as emitted by search tools
+	return /^[A-Za-z][A-Za-z0-9._-]{1,120}$/.test(t) && !t.includes("..");
+}
+
+function parsePathLinesFromSearchOutput(output: string, maxPaths: number): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const line of output.split("\n")) {
+		if (!lineLooksLikeRepoPath(line)) continue;
+		const p = line.trim().replace(/^\.\/+/, "");
+		if (!p || seen.has(p)) continue;
+		seen.add(p);
+		out.push(p);
+		if (out.length >= maxPaths) break;
+	}
+	return out;
+}
+
+async function discoverFilesByTaskKeywords(cwd: string, taskText: string, maxFiles: number): Promise<string[]> {
+	const terms = extractFeatureSearchTerms(taskText, 12);
+	if (terms.length === 0) return [];
+	const { spawnSync } = await import("node:child_process");
+	const hits = new Map<string, number>();
+
+	const rgList = (term: string): string[] => {
+		const args = [
+			"-F",
+			"--files-with-matches",
+			"--glob",
+			"!**/node_modules/**",
+			"--glob",
+			"!**/.git/**",
+			"--glob",
+			"!**/dist/**",
+			"--glob",
+			"!**/build/**",
+			"--glob",
+			"!**/.next/**",
+			"--",
+			term,
+			".",
+		];
+		try {
+			const r = spawnSync("rg", args, {
+				cwd,
+				encoding: "utf-8",
+				maxBuffer: 4 * 1024 * 1024,
+				timeout: 2800,
+			});
+			if (r.status === 0 && typeof r.stdout === "string" && r.stdout.trim()) {
+				return r.stdout
+					.trim()
+					.split("\n")
+					.map((l: string) => l.trim().replace(/^\.\/+/, ""))
+					.filter((l: string) => lineLooksLikeRepoPath(l));
+			}
+		} catch {
+			/* rg missing */
+		}
+		try {
+			const r2 = spawnSync(
+				"grep",
+				["-rIl", "--exclude-dir=node_modules", "--exclude-dir=.git", "--exclude-dir=dist", "-e", term, "."],
+				{ cwd, encoding: "utf-8", maxBuffer: 4 * 1024 * 1024, timeout: 3500 },
+			);
+			if (r2.status === 0 && typeof r2.stdout === "string" && r2.stdout.trim()) {
+				return r2.stdout
+					.trim()
+					.split("\n")
+					.map((l: string) => l.trim().replace(/^\.\/+/, ""))
+					.filter((l: string) => lineLooksLikeRepoPath(l));
+			}
+		} catch {
+			/* grep failed */
+		}
+		return [];
+	};
+
+	for (let i = 0; i < terms.length; i++) {
+		const weight = terms.length - i;
+		const files = rgList(terms[i]!).slice(0, 22);
+		for (const f of files) hits.set(f, (hits.get(f) ?? 0) + weight);
+	}
+
+	return [...hits.entries()]
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.map(([f]) => f)
+		.slice(0, maxFiles);
+}
+
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
  */
@@ -477,6 +660,52 @@ async function runLoop(
 		}
 	} catch {
 		/* not a git repo or git unavailable */
+	}
+
+	// Always merge task-ish text → ripgrep/grep hits with any hint/git paths (not only when empty).
+	const taskBlob = collectTaskTextForKeywordDiscovery(currentContext);
+	const keywordHits = await discoverFilesByTaskKeywords(process.cwd(), taskBlob, 22);
+	const normFoundKey = (p: string) => p.replace(/^\.\//, "");
+	const hadPriorFiles = foundFiles.length > 0;
+	const priorKeys = new Set(foundFiles.map((f) => normFoundKey(f)));
+	const newFromKeywords = keywordHits.filter((f) => !priorKeys.has(normFoundKey(f)));
+	if (keywordHits.length > 0) {
+		const seen = new Set<string>();
+		const merged: string[] = [];
+		const add = (p: string) => {
+			const n = normFoundKey(p);
+			if (seen.has(n)) return;
+			seen.add(n);
+			merged.push(p);
+		};
+		for (const f of foundFiles) add(f);
+		for (const f of keywordHits) add(f);
+		foundFiles = merged.slice(0, 28);
+		if (foundFiles.length > 0) workPhase = "absorb";
+	}
+	if (keywordHits.length > 0 && (!hadPriorFiles || newFromKeywords.length > 0)) {
+		const preview = foundFiles.slice(0, 12).map((p: string) => `- ${p}`).join("\n");
+		const terms = extractFeatureSearchTerms(taskBlob, 8);
+		const termNote =
+			terms.length > 0
+				? ` Search terms from task text: ${terms.map((t) => `\`${t}\``).join(", ")}.`
+				: "";
+		const extra =
+			hadPriorFiles && newFromKeywords.length > 0
+				? `Additional paths from task wording (not in the path list): ${newFromKeywords.slice(0, 10).map((p: string) => `\`${p}\``).join(", ")}. `
+				: "";
+		pendingMessages.push({
+			role: "user",
+			content: [
+				{
+					type: "text",
+					text: hadPriorFiles
+						? `Task-derived content search merged ${keywordHits.length} hit(s) into your target list. ${extra}Read before editing:\n${preview}${termNote}`
+						: `Pre-discovery: matched task text to ${keywordHits.length} candidate file(s). Read before editing:\n${preview}${termNote}`,
+				},
+			],
+			timestamp: Date.now(),
+		});
 	}
 
 	while (true) {
@@ -875,15 +1104,20 @@ async function runLoop(
 
 				if (workPhase === "search") {
 					for (const tr of toolResults) {
-						if (tr.toolName === "bash" && !tr.isError) {
+						if ((tr.toolName === "bash" || tr.toolName === "grep" || tr.toolName === "find") && !tr.isError) {
 							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
-							const paths = output.split("\n").filter((l: string) => l.trim().match(/\.\w+$/)).map((l: string) => l.trim());
+							const paths = parsePathLinesFromSearchOutput(output, 24);
 							if (paths.length > 0) {
 								foundFiles = paths.slice(0, 20);
 								workPhase = "absorb";
 								pendingMessages.push({
 									role: "user",
-									content: [{ type: "text", text: `Located ${foundFiles.length} candidate files. Read each file you intend to modify before making any edit:\n${foundFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}` }],
+									content: [
+										{
+											type: "text",
+											text: `Located ${foundFiles.length} candidate files. Read each file you intend to modify before making any edit:\n${foundFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}`,
+										},
+									],
 									timestamp: Date.now(),
 								});
 							}
@@ -1248,7 +1482,7 @@ async function streamAssistantResponse(
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
-		temperature: 0.1
+		temperature: 0.1,
 	});
 
 	let partialMessage: AssistantMessage | null = null;
