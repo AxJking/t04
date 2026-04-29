@@ -1248,6 +1248,7 @@ async function streamAssistantResponse(
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
+		temperature: 0.1
 	});
 
 	let partialMessage: AssistantMessage | null = null;
